@@ -1,0 +1,14 @@
+# Files the mod writes while you use it
+langdock-output/
+
+# Written by the Claude Code engine, never edit or commit
+**/.claude-plugin/types/
+tsconfig.json
+
+# Editors, OS, logs
+.DS_Store
+Thumbs.db
+*.log
+*~
+*.swp
+node_modules/
