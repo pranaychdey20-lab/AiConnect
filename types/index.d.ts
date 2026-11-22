@@ -96,8 +96,11 @@ export type LdUi = {
   draft: number
 }
 
+/** The AiConnect hub: which platform's screen is open (null = the platform list). */
+export type HubUi = { platform: string | null }
+
 declare module 'claude-code' {
   interface PluginState {
-    langdock: { ui: Shaped<LdUi> }
+    aiconnect: { langdockUi: Shaped<LdUi>; hub: Shaped<HubUi> }
   }
 }

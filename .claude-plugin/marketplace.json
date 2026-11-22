@@ -2,13 +2,13 @@
   "name": "aiconnect",
   "owner": { "name": "pranaychdey20-lab" },
   "metadata": {
-    "description": "Claude Code mods that connect AI platforms, one folder per platform."
+    "description": "Claude Code mod that connects AI platforms, one folder per platform."
   },
   "plugins": [
     {
-      "name": "langdock",
-      "source": "./langdock",
-      "description": "Use your Langdock workspace's models inside Claude Code: chat, code projects, images, documents, video and deep research."
+      "name": "aiconnect",
+      "source": "./",
+      "description": "Use your AI platforms inside Claude Code. Platforms: Langdock."
     }
   ]
 }

@@ -1,0 +1,12 @@
+{
+  "name": "aiconnect",
+  "version": "0.2.0",
+  "description": "Use your AI platforms inside Claude Code. /AiConnect lists your connected platforms; the first one is Langdock (GPT, Claude, Gemini and more: chat, code projects, images, documents, video, deep research).",
+  "author": { "name": "pranaychdey20-lab" },
+  "license": "MIT",
+  "homepage": "https://github.com/pranaychdey20-lab/AiConnect",
+  "repository": "https://github.com/pranaychdey20-lab/AiConnect",
+  "keywords": ["ai", "llm", "langdock", "claude-code-mod"],
+  "types": "./types/index.d.ts",
+  "network": { "hosts": ["app.langdock.com"] }
+}

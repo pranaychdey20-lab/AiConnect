@@ -1,13 +1,13 @@
 import { atom, read } from 'claude-code'
 
-import type { LdAttachment, LdChatRef, LdFile, LdModel, LdMsg, LdResult, LdUsage } from '../types'
+import type { LdAttachment, LdChatRef, LdFile, LdModel, LdMsg, LdResult, LdUsage } from '../../types'
 import { INITIAL, getCookie, getPrefs, setPrefs, setUi } from './state'
 import type { $T } from './state'
 
 // Langdock bridge: plain HTTP, SSE parsing and file writes. No model call is
 // made to move data between Langdock and Claude Code.
 
-const ui = atom({ plugin: 'langdock', key: 'ui' } as const, INITIAL, { shape: 'ui-4' })
+const ui = atom({ plugin: 'aiconnect', key: 'langdockUi' } as const, INITIAL, { shape: 'ui-5' })
 
 export const BASE = 'https://app.langdock.com'
 const ZERO_ID = '00000000-0000-0000-0000-000000000000'
@@ -57,7 +57,7 @@ export class LdError extends Error {}
 
 async function ld($: $T, path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) {
   const cookie = await getCookie($)
-  if (!cookie) throw new LdError('Not connected: click Connect in /langdock and paste your Langdock Cookie header.')
+  if (!cookie) throw new LdError('Not connected: click Connect in the Langdock screen of /AiConnect and paste your Langdock Cookie header.')
   const res = await $.http.fetch(BASE + path, {
     method: init.method ?? 'GET',
     body: init.body,
@@ -65,7 +65,7 @@ async function ld($: $T, path: string, init: { method?: string; headers?: Record
   })
   if (res.status === 401 || res.status === 403) {
     await setUi($, { status: 'Session expired: paste a fresh Cookie header' })
-    throw new LdError('Langdock session expired or invalid (HTTP ' + res.status + '). Click Connect in /langdock and paste a fresh Cookie header.')
+    throw new LdError('Langdock session expired or invalid (HTTP ' + res.status + '). Click Connect in the Langdock screen of /AiConnect and paste a fresh Cookie header.')
   }
   return res
 }

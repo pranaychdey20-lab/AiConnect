@@ -1,7 +1,7 @@
 import { atom, read } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { LdAttachment, LdFile, LdModel, LdMsg, LdResult, LdUi, LdUsage } from '../types'
+import type { LdAttachment, LdFile, LdModel, LdMsg, LdResult, LdUi, LdUsage } from '../../types'
 import {
   EFFORT_LABEL,
   PLUGINS,
@@ -17,14 +17,13 @@ import {
   uuid,
 } from './bridge'
 import type { AskInput } from './bridge'
-import { INITIAL, getCookie, getPrefs, setPrefs, setUi } from './state'
+import { INITIAL, clearCookie, getCookie, getPrefs, setCookie, setPrefs, setUi } from './state'
 import type { $T } from './state'
 
 // The same session value state.ts writes; the scan wants it declared in each file that reads it.
-const ui = atom({ plugin: 'langdock', key: 'ui' } as const, INITIAL, { shape: 'ui-4' })
+const ui = atom({ plugin: 'aiconnect', key: 'langdockUi' } as const, INITIAL, { shape: 'ui-5' })
 
-const CHAT = 'langdock'
-const TOOL_FULL = 'mcp__langdock__ask'
+const TOOL_FULL = 'mcp__aiconnect__langdock_ask'
 
 // Langdock's dark theme.
 const C = {
@@ -123,10 +122,9 @@ async function newChat($: $T): Promise<void> {
   await setUi($, u => ({ view: 'home', messages: [], chatTitle: '', menu: 'none', draft: u.draft + 1 }))
 }
 
-/** /langdock always lands on the home screen. */
-async function openChat($: $T): Promise<void> {
+/** Called by the hub when the Langdock tile is opened: always lands on the home screen. */
+export async function enterLangdock($: $T): Promise<void> {
   await newChat($)
-  await $.ui.open({ id: CHAT, title: 'Langdock' })
   if (await getCookie($)) void refreshHistory($).catch(() => undefined)
 }
 
@@ -189,41 +187,42 @@ function resetText(iso: string | null): string {
 
 // ---------------------------------------------------------------- register
 
-export const register: Register = on => {
-  on('session.start', async ($, e, next) => {
-    setSessionCwd(e.cwd)
-    const started = await next(e)
-    await $.tool.register({
-      name: 'ask',
-      isDeferred: false,
-      description:
-        "Send a task to the user's Langdock workspace (frontier models such as GPT-6.2 Astra, Fable 5.2, Opus 5.5, Gemini 4) and get the result back. " +
-        'Langdock runs it in its own sandbox and can return text, code projects (written into the project, or into the folder the user picked), images, PDFs/Word/Markdown documents, videos and deep research. ' +
-        'Use it when the user asks to use Langdock or one of its models, or for image/document/video generation. It continues the open Langdock chat unless newConversation is true. ' +
-        "Leave model/reasoning/plugin empty to use what the user picked in the Langdock pane. The reply is Langdock's final answer plus the local paths of saved files.",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The full task for the Langdock model.' },
-          model: { type: 'string', description: 'Optional model display name, e.g. "GPT-6.2 Astra", "Fable 5.2", "Opus 5.5", or "Auto".' },
-          reasoning: { type: 'string', enum: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], description: 'Optional reasoning effort.' },
-          plugin: { type: 'string', enum: ['', ...PLUGINS.map(p => p.id)], description: 'Optional plugin: web_search, image_generation, write_document, internal_search, research.' },
-          documentFormat: { type: 'string', enum: ['pdf', 'docx', 'md'], description: 'With plugin write_document: the output format.' },
-          newConversation: { type: 'boolean', description: 'Start a new Langdock chat instead of continuing the open one.' },
-          files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths of local files to attach.' },
-        },
-        required: ['prompt'],
+/** Session setup, called by the hub's session.start hook once the session is bound. */
+export async function startLangdock($: $T, cwd: string): Promise<void> {
+  setSessionCwd(cwd)
+  await $.tool.register({
+    name: 'langdock_ask',
+    isDeferred: false,
+    description:
+      "Send a task to the user's Langdock workspace (frontier models such as GPT-6.2 Astra, Fable 5.2, Opus 5.5, Gemini 4) and get the result back. " +
+      'Langdock runs it in its own sandbox and can return text, code projects (written into the project, or into the folder the user picked), images, PDFs/Word/Markdown documents, videos and deep research. ' +
+      'Use it when the user asks to use Langdock or one of its models, or for image/document/video generation. It continues the open Langdock chat unless newConversation is true. ' +
+      "Leave model/reasoning/plugin empty to use what the user picked in the Langdock pane. The reply is Langdock's final answer plus the local paths of saved files.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The full task for the Langdock model.' },
+        model: { type: 'string', description: 'Optional model display name, e.g. "GPT-6.2 Astra", "Fable 5.2", "Opus 5.5", or "Auto".' },
+        reasoning: { type: 'string', enum: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], description: 'Optional reasoning effort.' },
+        plugin: { type: 'string', enum: ['', ...PLUGINS.map(p => p.id)], description: 'Optional plugin: web_search, image_generation, write_document, internal_search, research.' },
+        documentFormat: { type: 'string', enum: ['pdf', 'docx', 'md'], description: 'With plugin write_document: the output format.' },
+        newConversation: { type: 'boolean', description: 'Start a new Langdock chat instead of continuing the open one.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Optional absolute paths of local files to attach.' },
       },
-    })
-    await $.command.register({ name: 'langdock', description: 'Open the Langdock chat (connect, models, files, usage)', argumentHint: '[prompt]' })
-
-    const prefs = await getPrefs($)
-    const hasCookie = !!(await getCookie($))
-    await setUi($, { prefs, hasCookie, busy: false })
-    if (hasCookie) void connect($)
-    return started
+      required: ['prompt'],
+    },
   })
 
+  const prefs = await getPrefs($)
+  const hasCookie = !!(await getCookie($))
+  await setUi($, { prefs, hasCookie, busy: false })
+  if (hasCookie) void connect($)
+}
+
+type On = Parameters<Register>[0]
+
+/** Langdock's own hooks: hiding and serving the tool Claude can call. The hub registers the command, pane and session start. */
+export function registerLangdock(on: On): void {
   // The mod is "on" while connected: with no cookie, Claude is not offered the tool at all.
   on('tool.list', async ($, e, next) => {
     const r = await next(e)
@@ -249,17 +248,14 @@ export const register: Register = on => {
     const { files: _f, ...rest } = input
     return { result: await send($, { ...rest, attachments }, false) }
   })
+}
 
-  on('command.run', { command: 'langdock' }, async ($, e) => {
-    const prompt = e.args.trim()
-    await openChat($)
-    if (prompt) void send($, { prompt }, true)
-    return { text: prompt ? 'Sent to Langdock. The answer appears in the Langdock pane.' : 'Langdock opened.', isTextDisplayOnly: true }
-  })
+// ---------------------------------------------------------------- the chat pane
 
-  // ---------------------------------------------------------------- the chat pane
+type RenderEvent = Parameters<$T['ui']['resolve']>[0]
 
-  on('ui.render', { component: 'Pane', requestId: CHAT }, async ($, e) => {
+/** Draws the Langdock chat; `onBack` returns to the AiConnect platform list. */
+export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promise<void>): Promise<unknown> {
     const els = $.ui.resolve(e) as unknown as Record<string, any>
     const { Box, Text, Button, Input, Select, Markdown, Progress } = els
     const Svg = els.Svg
@@ -337,7 +333,7 @@ export const register: Register = on => {
             onSubmit={async (value: string) => {
               const cookie = value.replace(/^\s*cookie:\s*/i, '').trim()
               if (!cookie) return
-              await $.store.set('cookie', cookie)
+              await setCookie($, cookie)
               await setUi($, { hasCookie: true, status: 'Connecting…', menu: 'none' })
               await connect($)
               $.ui.invalidate('tool.list')
@@ -360,7 +356,7 @@ export const register: Register = on => {
             key="disconnect"
             label="Disconnect"
             onPress={async () => {
-              await $.store.delete('cookie')
+              await clearCookie($)
               await setUi($, { hasCookie: false, models: [], usage: null, history: [], status: 'Not connected', menu: 'none' })
               $.ui.invalidate('tool.list')
             }}
@@ -584,6 +580,7 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
           <Box flexDirection="row" gap={1} alignItems="center">
+            <Button key="back" plain label="‹ Platforms" onPress={async () => { await onBack() }} />
             {connectButton}
             <Button key="info" plain label="ⓘ" onPress={async () => { await menu('guide') }} />
             {s.view === 'chat' ? <Text weight="semibold" color={C.text} wrap="truncate">{s.chatTitle || 'Chat'}</Text> : null}
@@ -672,5 +669,4 @@ export const register: Register = on => {
         {chips}
       </Box>
     )
-  })
 }
