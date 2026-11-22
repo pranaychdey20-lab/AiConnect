@@ -1,6 +1,6 @@
 import { atom, read } from 'claude-code'
 
-import type { LdAttachment, LdChatRef, LdFile, LdModel, LdMsg, LdResult, LdUsage } from '../../types'
+import type { LdAttachment, LdChatRef, LdFile, LdModel, LdMsg, LdPart, LdPreview, LdQuestion, LdResult, LdUsage } from '../../types'
 import { INITIAL, getCookie, getPrefs, setPrefs, setUi } from './state'
 import type { $T } from './state'
 
@@ -200,20 +200,6 @@ export function uuid(): string {
 
 type SseEvent = Record<string, unknown> & { type?: string }
 
-function parseSse(text: string): SseEvent[] {
-  const out: SseEvent[] = []
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith('data:')) continue
-    const data = line.slice(5).trim()
-    if (!data || data === '[DONE]') continue
-    try {
-      out.push(JSON.parse(data) as SseEvent)
-    } catch {
-      // partial or non-JSON line
-    }
-  }
-  return out
-}
 
 function resolveModel(models: LdModel[], want: string | undefined, fallbackId: string): LdModel | null {
   const key = (want ?? '').trim().toLowerCase()
@@ -284,6 +270,16 @@ async function outputDir($: $T, prompt: string): Promise<string> {
   return prefs.workFolder ? prefs.workFolder : joinPath(sessionCwd, `langdock-output/${stamp()}-${slug(prompt)}`)
 }
 
+/** Downloads a file from an older chat into a temp cache (for its inline picture), once. */
+export async function cacheRemote($: $T, f: LdFile): Promise<string | null> {
+  if (!f.url) return null
+  const tmp = (await $.env.get('TEMP')) ?? '.'
+  const key = f.url.split('/').slice(-2).join('-').replace(/[^A-Za-z0-9._-]/g, '_')
+  const dest = joinPath(joinPath(tmp, 'aiconnect-cache'), key)
+  if (await $.fs.exists(dest)) return dest
+  return (await curlDownload($, f.url, dest)) ? dest : null
+}
+
 /** Downloads one file that is still on Langdock (from an older chat). */
 export async function downloadRemote($: $T, f: LdFile): Promise<string | null> {
   if (!f.url) return null
@@ -343,6 +339,110 @@ function fencedFiles(text: string): { path: string; content: string }[] {
   return out
 }
 
+// ---------------------------------------------------------------- step labels, previews, projects, answers
+
+const TOOL_LABELS: Record<string, string> = {
+  bash: 'Running commands',
+  write: 'Writing files',
+  edit: 'Editing files',
+  read: 'Reading files',
+  list: 'Looking at files',
+  image_generation: 'Generating an image',
+  deliver_files: 'Preparing files',
+  web_search: 'Searching the web',
+  research: 'Researching',
+}
+
+function toolLabel(name: string, detail: string | undefined): string {
+  const base = TOOL_LABELS[name] ?? name.replace(/_/g, ' ')
+  return detail && detail.trim() ? `${base}: ${detail.trim()}` : base
+}
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|bmp)$/i
+
+export function isImageName(name: string): boolean {
+  return IMAGE_EXT.test(name)
+}
+
+/** A small JPEG of an image file, as a data URI, sized to fit the pane's SVG element (128 KB). */
+export async function previewOf($: $T, path: string): Promise<LdPreview | null> {
+  if (!isImageName(path)) return null
+  const script = [
+    'Add-Type -AssemblyName System.Drawing',
+    "$p='" + path.replace(/\//g, '\\').replace(/'/g, "''") + "'",
+    'try {',
+    '  $img=[System.Drawing.Image]::FromFile($p)',
+    '  $w=$img.Width; $h=$img.Height',
+    '  $s=[Math]::Min(1.0, 640.0/[Math]::Max($w,$h))',
+    '  $enc=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq "image/jpeg" } | Select-Object -First 1',
+    '  while ($true) {',
+    '    $nw=[Math]::Max(1,[int]($w*$s)); $nh=[Math]::Max(1,[int]($h*$s))',
+    '    $bmp=New-Object System.Drawing.Bitmap($nw,$nh)',
+    '    $g=[System.Drawing.Graphics]::FromImage($bmp); $g.Clear([System.Drawing.Color]::White)',
+    "    $g.InterpolationMode='HighQualityBicubic'; $g.DrawImage($img,0,0,$nw,$nh); $g.Dispose()",
+    '    $ms=New-Object System.IO.MemoryStream',
+    '    $ep=New-Object System.Drawing.Imaging.EncoderParameters(1)',
+    '    $ep.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[int64]72)',
+    '    $bmp.Save($ms,$enc,$ep); $b=[Convert]::ToBase64String($ms.ToArray()); $bmp.Dispose()',
+    '    if ($b.Length -lt 90000 -or $nw -lt 120) { break }',
+    '    $s=$s*0.8',
+    '  }',
+    '  $img.Dispose()',
+    '  Write-Output ("$nw|$nh|$b")',
+    '} catch { exit 1 }',
+  ].join('\n')
+  try {
+    const r = await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) return null
+    const [w, h, b64] = r.stdout.trim().split('|')
+    if (!w || !h || !b64) return null
+    return { uri: 'data:image/jpeg;base64,' + b64, w: Number(w), h: Number(h) }
+  } catch {
+    return null
+  }
+}
+
+/** The page to open for a project: an index.html among the saved files, or inside an extracted zip. */
+export async function findEntry($: $T, files: LdFile[]): Promise<string | null> {
+  const direct = files.find(f => f.path && /(^|\/)index\.html$/i.test(f.name.replace(/\\/g, '/')))
+  if (direct) return direct.path
+  const look = async (dir: string, depth: number): Promise<string | null> => {
+    let entries
+    try {
+      entries = await $.fs.list(dir)
+    } catch {
+      return null
+    }
+    const idx = entries.find(e => e.kind === 'file' && e.name.toLowerCase() === 'index.html')
+    if (idx) return joinPath(dir, idx.name)
+    if (depth > 0) {
+      for (const e of entries) {
+        if (e.kind === 'file' || e.name === 'node_modules' || e.name === '.git') continue
+        const found = await look(joinPath(dir, e.name), depth - 1)
+        if (found) return found
+      }
+    }
+    return null
+  }
+  for (const f of files) {
+    if (f.kind === 'folder' && f.path) {
+      const found = await look(f.path, 2)
+      if (found) return found
+    }
+  }
+  return null
+}
+
+/** Sends the person's answer to a question Langdock is waiting on; the paused reply then continues. */
+export async function answerQuestion($: $T, convId: string, part: { id: string; sessionId: string }, payload: unknown): Promise<boolean> {
+  const r = await ld($, '/api/engine/complete-awakeable', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-app-version': await fetchVersion($) },
+    body: JSON.stringify({ conversationId: convId, toolCallId: part.id, sessionId: part.sessionId, payload }),
+  })
+  return r.ok
+}
+
 // ---------------------------------------------------------------- ask
 
 export type AskInput = {
@@ -355,7 +455,16 @@ export type AskInput = {
   attachments?: LdAttachment[]
 }
 
-export async function runAsk($: $T, input: AskInput): Promise<LdResult & { convId: string; modelProvider?: string }> {
+/** Lets the caller show a reply as it streams in. */
+export type AskHooks = {
+  onParts: (parts: LdPart[]) => Promise<void> | void
+  /** Langdock asked the person something and is waiting for the answer. */
+  onAwaiting?: () => Promise<void> | void
+}
+
+type RawQuestion = { id?: string; question?: string; type?: string; options?: { id?: string; label?: string }[] }
+
+export async function runAsk($: $T, input: AskInput, hooks?: AskHooks): Promise<LdResult & { convId: string; modelProvider?: string; parts: LdPart[] }> {
   const prefs = await getPrefs($)
   let models = (await read($, ui)).models
   if (!models.length) models = await refreshModels($)
@@ -435,36 +544,42 @@ export async function runAsk($: $T, input: AskInput): Promise<LdResult & { convI
     body.modeContext = { mode: 'document', format: docFormat }
   }
 
-  const send = async () =>
-    ld($, '/api/engine', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-app-version': await fetchVersion($), 'x-langdock-stream-end': 'waiting' },
-      body: JSON.stringify(body),
-    })
-
-  let res = await send()
-  if (res.text.includes('A new version of Langdock is available')) {
-    await fetchVersion($, true)
-    res = await send()
-  }
-  if (!res.ok) throw new LdError(`Langdock rejected the request (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
-
   await setPrefs($, { convId, lastTurnId: turnId })
 
-  // ---- parse the UI-message stream
-  const events = parseSse(res.text)
-  let text = ''
-  let error = ''
-  let title = ''
+  // ---- stream the reply with curl, so a long answer is never cut at 30 s, and show it as it arrives
+  const parts: LdPart[] = []
   const writes = new Map<string, string>()
   const remote = new Map<string, { name: string; url: string; kind: string }>()
-  for (const ev of events) {
+  let error = ''
+  let title = ''
+  let sawEvents = false
+  let lastFlush = 0
+  let curText: LdPart | null = null
+  let curThought: LdPart | null = null
+
+  const flush = async (force = false): Promise<void> => {
+    const now = Date.now()
+    if (!force && now - lastFlush < 200) return
+    lastFlush = now
+    await hooks?.onParts(parts.map(p => ({ ...p })))
+  }
+
+  const apply = async (ev: SseEvent): Promise<void> => {
+    const id = String(ev.toolCallId ?? '')
     switch (ev.type) {
+      case 'reasoning-start':
+        curThought = { kind: 'thought', text: '' }
+        parts.push(curThought)
+        break
+      case 'reasoning-delta':
+        if (curThought && curThought.kind === 'thought') curThought.text += String(ev.delta ?? '')
+        break
       case 'text-start':
-        text = '' // keep only the answer after the last tool step
+        curText = { kind: 'text', text: '' }
+        parts.push(curText)
         break
       case 'text-delta':
-        text += String(ev.delta ?? '')
+        if (curText && curText.kind === 'text') curText.text += String(ev.delta ?? '')
         break
       case 'error':
         error = String(ev.errorText ?? 'Langdock error')
@@ -472,18 +587,113 @@ export async function runAsk($: $T, input: AskInput): Promise<LdResult & { convI
       case 'data-conversation-title':
         title = String(ev.data ?? '')
         break
+      case 'tool-input-start':
+        if (ev.toolName !== 'ask_user_questions') parts.push({ kind: 'tool', id, label: toolLabel(String(ev.toolName ?? ''), undefined), state: 'running' })
+        break
       case 'tool-input-available': {
-        const inp = (ev.input ?? {}) as { path?: string; content?: string }
+        const inp = (ev.input ?? {}) as { path?: string; content?: string; name?: string }
         if (ev.toolName === 'write' && typeof inp.path === 'string' && typeof inp.content === 'string') writes.set(inp.path, inp.content)
+        const t = parts.find(p => p.kind === 'tool' && p.id === id)
+        if (t && t.kind === 'tool') t.label = toolLabel(String(ev.toolName ?? ''), inp.name)
         break
       }
-      case 'tool-output-available':
+      case 'tool-output-available': {
+        const out = ev.output as { error?: unknown; dismissed?: unknown } | undefined
+        const t = parts.find(p => (p.kind === 'tool' || p.kind === 'question') && p.id === id)
+        if (t && t.kind === 'tool') t.state = out && typeof out.error === 'string' ? 'error' : 'done'
+        if (t && t.kind === 'question') t.state = out && out.dismissed === true ? 'dismissed' : 'answered'
         for (const f of filesOf(ev.output)) remote.set(f.url, f)
         break
+      }
+      case 'data-tool-awaiting': {
+        const d = (ev.data ?? {}) as { sessionId?: string; toolCallId?: string; toolName?: string; input?: { questions?: RawQuestion[] } }
+        const cid = String(d.toolCallId ?? '')
+        if (d.toolName === 'ask_user_questions') {
+          const questions: LdQuestion[] = (d.input?.questions ?? []).map(q => ({
+            id: String(q.id),
+            text: String(q.question ?? ''),
+            multi: q.type === 'multi_select',
+            options: (q.options ?? []).map(o => ({ id: String(o.id), label: String(o.label ?? o.id) })),
+          }))
+          parts.push({ kind: 'question', id: cid, sessionId: String(d.sessionId ?? ''), questions, selected: {}, other: {}, state: 'open' })
+        } else {
+          parts.push({ kind: 'waiting', id: cid, label: 'Langdock is waiting for an action that only its web app can take. Open this chat on app.langdock.com to continue.' })
+        }
+        await flush(true)
+        await hooks?.onAwaiting?.()
+        break
+      }
+      case 'data-tool-awaiting-resolved': {
+        const d = (ev.data ?? {}) as { toolCallId?: string }
+        const q = parts.find(p => p.kind === 'question' && p.id === d.toolCallId)
+        if (q && q.kind === 'question' && q.state !== 'dismissed') q.state = 'answered'
+        break
+      }
     }
   }
-  if (!events.length && !error) error = res.text.slice(0, 300) || 'Empty response from Langdock'
+
+  const runStream = async (): Promise<{ plain: string; status: number | null }> => {
+    const cookie = (await getCookie($)) ?? ''
+    const argv = [
+      'curl', '-sS', '-N', '-X', 'POST',
+      '-H', 'Cookie: ' + cookie, '-H', 'Origin: ' + BASE, '-H', 'Referer: ' + BASE + '/chat',
+      '-H', 'content-type: application/json', '-H', 'x-app-version: ' + (await fetchVersion($)), '-H', 'x-langdock-stream-end: waiting',
+      '-w', '\n__HTTP__%{http_code}',
+      '--data-binary', '@-',
+      BASE + '/api/engine',
+    ]
+    const it = $.process.spawn({ argv, input: JSON.stringify(body) })
+    let buf = ''
+    let plain = ''
+    let stderr = ''
+    for (;;) {
+      const n = await it.next()
+      if (n.done) break
+      if (n.value.stream === 'stderr') {
+        stderr += n.value.text
+        continue
+      }
+      buf += n.value.text
+      plain = (plain + n.value.text).slice(-20000)
+      for (let nl = buf.indexOf('\n'); nl >= 0; nl = buf.indexOf('\n')) {
+        const line = buf.slice(0, nl).replace(/\r$/, '')
+        buf = buf.slice(nl + 1)
+        if (!line.startsWith('data:')) continue
+        try {
+          const ev = JSON.parse(line.slice(5).trim()) as SseEvent
+          sawEvents = true
+          await apply(ev)
+        } catch {
+          // a line that is not JSON
+        }
+      }
+      await flush()
+    }
+    if (stderr.trim() && !sawEvents) plain = stderr
+    const status = Number(plain.match(/__HTTP__(\d+)/)?.[1] ?? 0) || null
+    return { plain, status }
+  }
+
+  let attempt = await runStream()
+  if (!sawEvents && attempt.plain.includes('A new version of Langdock is available')) {
+    await fetchVersion($, true)
+    attempt = await runStream()
+  }
+  if (!sawEvents && (attempt.status === 401 || attempt.status === 403)) {
+    await setUi($, { status: 'Session expired: paste a fresh Cookie header' })
+    throw new LdError('Langdock session expired or invalid (HTTP ' + attempt.status + '). Click Connect and paste a fresh Cookie header.')
+  }
+  if (!sawEvents && !error) error = attempt.plain.replace(/__HTTP__\d+/, '').trim().slice(0, 300) || 'Empty response from Langdock'
+  await flush(true)
   if (title) await setUi($, { chatTitle: title })
+
+  // The answer is the text after the last tool step.
+  const lastTool = parts.map(p => p.kind).lastIndexOf('tool')
+  const text = parts
+    .slice(lastTool + 1)
+    .map(p => (p.kind === 'text' ? p.text.trim() : ''))
+    .filter(Boolean)
+    .join('\n\n')
 
   // ---- land the outputs locally
   const outDir = await outputDir($, input.prompt)
@@ -534,12 +744,24 @@ export async function runAsk($: $T, input: AskInput): Promise<LdResult & { convI
     files.push({ name: f.path, path: dest, kind: 'file' })
   }
 
+  // Small inline pictures for image files, and the page to open for a project.
+  for (const f of files) {
+    if (f.path && isImageName(f.name)) {
+      const preview = await previewOf($, f.path)
+      if (preview) f.preview = preview
+    }
+  }
+  const entry = files.length ? await findEntry($, files) : null
+  const project = files.length && (entry || files.length > 1) ? { dir: outDir, entry } : undefined
+
   void refreshUsage($).catch(() => undefined)
   if (fresh) void refreshHistory($).catch(() => undefined)
   return {
     prompt: input.prompt,
-    text: text.trim(),
+    text,
     files,
+    parts,
+    ...(project ? { project } : {}),
     outDir: files.length ? outDir : '',
     model: model ? `${model.name}${effort ? ' · ' + (EFFORT_LABEL[effort] ?? effort) : ''}` : 'Auto',
     at: new Date().toISOString(),
@@ -582,7 +804,12 @@ export async function loadChat($: $T, ref: LdChatRef): Promise<LdMsg[]> {
       const seen = new Set<string>()
       const files: LdFile[] = []
       for (const p of parts) for (const f of p.type.startsWith('tool-') ? filesOf(p.output) : []) if (!seen.has(f.url)) (seen.add(f.url), files.push({ name: f.name, path: '', url: f.url, kind: f.kind }))
-      msgs.push({ id: r.id, role: 'assistant', text, files, model: r.metadata?.modelName ?? undefined, provider: r.metadata?.modelProvider ?? undefined })
+      const hist: LdPart[] = []
+      for (const p of parts) {
+        if (p.type === 'reasoning' && p.text) hist.push({ kind: 'thought', text: p.text })
+        else if (p.type === 'text' && p.text) hist.push({ kind: 'text', text: p.text })
+      }
+      msgs.push({ id: r.id, role: 'assistant', text, files, parts: hist, model: r.metadata?.modelName ?? undefined, provider: r.metadata?.modelProvider ?? undefined })
     }
   }
   await setPrefs($, { convId: ref.id, lastTurnId: lastUser })

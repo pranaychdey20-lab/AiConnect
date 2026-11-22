@@ -1,16 +1,20 @@
-import { atom, read } from 'claude-code'
+import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { LdAttachment, LdFile, LdModel, LdMsg, LdResult, LdUi, LdUsage } from '../../types'
+import type { LdAttachment, LdFile, LdModel, LdMsg, LdPart, LdResult, LdUi, LdUsage } from '../../types'
 import {
   EFFORT_LABEL,
   PLUGINS,
+  answerQuestion,
+  cacheRemote,
   connect,
   downloadRemote,
+  isImageName,
   joinPath,
   loadChat,
   pickFiles,
   pickFolder,
+  previewOf,
   refreshHistory,
   runAsk,
   setSessionCwd,
@@ -79,7 +83,7 @@ function formatResult(r: LdResult): string {
 
 /** Sends one message; the chat shows it whether the person or Claude sent it. */
 async function send($: $T, input: AskInput, fromUi: boolean): Promise<string> {
-  if (!(await getCookie($))) return 'Not connected: open /langdock and click Connect.'
+  if (!(await getCookie($))) return 'Not connected: open /AiConnect, choose Langdock and click Connect.'
   const prefs = await getPrefs($)
   const s = await read($, ui)
   if (s.busy) return 'Langdock is still working on the previous message.'
@@ -101,15 +105,29 @@ async function send($: $T, input: AskInput, fromUi: boolean): Promise<string> {
     messages: [...(fresh ? [] : u.messages), userMsg, { id: pendId, role: 'assistant', text: '', files: [], pending: true }],
     ...(fromUi ? { attachments: [], draft: u.draft + 1 } : {}),
   }))
-  const settle = (m: Partial<LdMsg>) => setUi($, u => ({ messages: u.messages.map(x => (x.id === pendId ? { ...x, ...m, pending: false } : x)) }))
+  const startedAt = Date.now()
+  const upd = (m: Partial<LdMsg>, done: boolean) =>
+    setUi($, u => ({ messages: u.messages.map(x => (x.id === pendId ? { ...x, ...m, ...(done ? { pending: false } : {}) } : x)) }))
   try {
-    const r = await runAsk($, { ...input, newConversation: fresh })
-    await settle({ text: r.text, files: r.files, model: r.model, provider: r.modelProvider, ...(r.error ? { error: r.error } : {}) })
+    const r = await runAsk($, { ...input, newConversation: fresh }, { onParts: parts => upd({ parts }, false), ...(fromUi ? {} : { onAwaiting: () => surfaceQuestion($) }) })
+    await upd(
+      {
+        text: r.text,
+        files: r.files,
+        parts: r.parts,
+        ...(r.project ? { project: r.project } : {}),
+        model: r.model,
+        provider: r.modelProvider,
+        seconds: Math.round((Date.now() - startedAt) / 1000),
+        ...(r.error ? { error: r.error } : {}),
+      },
+      true,
+    )
     await setUi($, { last: r, status: r.error ? 'Last message failed' : 'Connected' })
     return formatResult(r)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    await settle({ error: msg })
+    await upd({ error: msg }, true)
     await setUi($, { status: msg.slice(0, 120) })
     return `Langdock error: ${msg}`
   } finally {
@@ -183,6 +201,92 @@ function resetText(iso: string | null): string {
   if (d.toDateString() === now.toDateString()) return `Resets at ${time}`
   if (d.toDateString() === tomorrow.toDateString()) return `Resets tomorrow at ${time}`
   return `Resets ${d.toLocaleDateString([], { weekday: 'short' })} ${time}`
+}
+
+// ---------------------------------------------------------------- questions, images, projects
+
+type QuestionPart = Extract<LdPart, { kind: 'question' }>
+
+/** Changes one step of one message. */
+async function mapPart($: $T, msgId: string, partId: string, fn: (p: QuestionPart) => QuestionPart): Promise<void> {
+  await setUi($, u => ({
+    messages: u.messages.map(m =>
+      m.id === msgId ? { ...m, parts: (m.parts ?? []).map(p => (p.kind === 'question' && p.id === partId ? fn(p) : p)) } : m,
+    ),
+  }))
+}
+
+async function findQuestion($: $T, msgId: string, partId: string): Promise<QuestionPart | null> {
+  const s = await read($, ui)
+  const part = s.messages.find(m => m.id === msgId)?.parts?.find(p => p.kind === 'question' && p.id === partId)
+  return part && part.kind === 'question' ? part : null
+}
+
+async function pickOption($: $T, msgId: string, partId: string, qid: string, optId: string, multi: boolean): Promise<void> {
+  await mapPart($, msgId, partId, p => {
+    if (p.state !== 'open') return p
+    const cur = p.selected[qid] ?? []
+    const next = multi ? (cur.includes(optId) ? cur.filter(x => x !== optId) : [...cur, optId]) : [optId]
+    return { ...p, selected: { ...p.selected, [qid]: next } }
+  })
+}
+
+async function typeOther($: $T, msgId: string, partId: string, qid: string, text: string): Promise<void> {
+  await mapPart($, msgId, partId, p => (p.state === 'open' ? { ...p, other: { ...p.other, [qid]: text } } : p))
+}
+
+/** Sends the answers (or a skip) to Langdock; the paused reply then carries on by itself. */
+async function submitQuestion($: $T, msgId: string, partId: string, skip: boolean): Promise<void> {
+  const part = await findQuestion($, msgId, partId)
+  if (!part || part.state !== 'open') return
+  const answers: Record<string, { question: string; selected: string[]; other?: string }> = {}
+  for (const q of part.questions) {
+    const selected = part.selected[q.id] ?? []
+    const other = (part.other[q.id] ?? '').trim()
+    if (!skip && !selected.length) return void setUi($, { status: `Pick an answer for: ${q.text}` })
+    if (!skip && selected.includes('__other__') && !other) return void setUi($, { status: `Type your answer for: ${q.text}` })
+    answers[q.id] = { question: q.text, selected, ...(selected.includes('__other__') ? { other } : {}) }
+  }
+  await mapPart($, msgId, partId, p => ({ ...p, state: 'sending' }))
+  const convId = (await getPrefs($)).convId
+  const ok = convId ? await answerQuestion($, convId, part, skip ? { dismissed: true, answers: {} } : { dismissed: false, answers }) : false
+  if (!ok) {
+    await mapPart($, msgId, partId, p => ({ ...p, state: 'open' }))
+    await setUi($, { status: "Couldn't send the answer to Langdock" })
+  }
+}
+
+// The hub's state, so a question asked while Claude called the tool can open this screen.
+const hub = atom({ plugin: 'aiconnect', key: 'hub' } as const, { platform: null }, { shape: 'hub-1' })
+
+/** A question arrived from a call Claude made: bring the Langdock screen up so the person can answer. */
+async function surfaceQuestion($: $T): Promise<void> {
+  await update($, hub, () => ({ platform: 'langdock' }))
+  await $.ui.open({ id: 'aiconnect', title: 'AiConnect' })
+}
+
+async function revealLocal($: $T, path: string): Promise<void> {
+  await $.process.run(['explorer.exe', '/select,' + path.replace(/\//g, '\\')], { timeoutMs: 10_000 })
+}
+
+/** Gives the first few images of an opened chat a picture, without the person downloading them. */
+async function hydrateImages($: $T, msgs: LdMsg[]): Promise<void> {
+  let n = 0
+  for (const m of msgs) {
+    for (const f of m.files) {
+      if (n >= 6) return
+      if (f.preview || !f.url || !isImageName(f.name)) continue
+      n++
+      const path = await cacheRemote($, f)
+      if (!path) continue
+      const preview = await previewOf($, path)
+      await setUi($, u => ({
+        messages: u.messages.map(mm =>
+          mm.id === m.id ? { ...mm, files: mm.files.map(ff => (ff.url === f.url ? { ...ff, path, ...(preview ? { preview } : {}) } : ff)) } : mm,
+        ),
+      }))
+    }
+  }
 }
 
 // ---------------------------------------------------------------- register
@@ -559,7 +663,6 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
     const recent = (
       <Select
         key="recent"
-        label="Chats"
         options={[{ value: '', label: 'Recent chats' }, ...s.history.map(h => ({ value: h.id, label: h.name }))]}
         value=""
         onSelect={async (id: string) => {
@@ -569,6 +672,7 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
           try {
             const messages = await loadChat($, ref)
             await setUi($, { messages, status: 'Connected' })
+            void hydrateImages($, messages)
           } catch (err) {
             await setUi($, { status: err instanceof Error ? err.message : String(err) })
           }
@@ -583,7 +687,6 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
             <Button key="back" plain label="‹ Platforms" onPress={async () => { await onBack() }} />
             {connectButton}
             <Button key="info" plain label="ⓘ" onPress={async () => { await menu('guide') }} />
-            {s.view === 'chat' ? <Text weight="semibold" color={C.text} wrap="truncate">{s.chatTitle || 'Chat'}</Text> : null}
           </Box>
           <Box flexDirection="row" gap={1} alignItems="center">
             {recent}
@@ -591,6 +694,7 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
           </Box>
         </Box>
         {topDrop}
+        {s.view === 'chat' && s.chatTitle ? <Text weight="semibold" color={C.text} wrap="truncate">{s.chatTitle}</Text> : null}
       </Box>
     )
 
@@ -637,6 +741,110 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
         <Text key={`f-${m.id}-${i}`} size="caption" color={C.muted}>{f.name}</Text>
       )
 
+    // An image shows right in the chat; a video gets a card with Play, since the pane cannot play video.
+    const isVideo = (f: LdFile) => /\.(mp4|webm|mov|mkv|avi)$/i.test(f.name) || /video/i.test(f.kind)
+    const fileView = (m: LdMsg, f: LdFile, i: number) => {
+      if (f.preview && Svg) {
+        const w = Math.min(f.preview.w, 420)
+        const ph = Math.max(1, Math.round((f.preview.h * w) / f.preview.w))
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${f.preview.w}" height="${f.preview.h}" viewBox="0 0 ${f.preview.w} ${f.preview.h}"><image href="${f.preview.uri}" width="${f.preview.w}" height="${f.preview.h}"/></svg>`
+        return (
+          <Box key={`img-${m.id}-${i}`} flexDirection="column" gap={0}>
+            <Svg source={svg} alt={f.name} width={w} height={ph} />
+            {fileRow(m, f, i)}
+          </Box>
+        )
+      }
+      if (isVideo(f) && f.path) {
+        return (
+          <Box key={`vid-${m.id}-${i}`} flexDirection="column" gap={1} padding={1} borderStyle="round" borderColor={C.border} backgroundColor={C.surface}>
+            <Text color={C.text}>🎬 {f.name}</Text>
+            <Box flexDirection="row" gap={1}>
+              <Button key={`play-${m.id}-${i}`} variant="primary" label="▶ Play" onPress={async () => { await openLocal($, f.path) }} />
+              <Button key={`reveal-${m.id}-${i}`} label="Show in folder" onPress={async () => { await revealLocal($, f.path) }} />
+            </Box>
+          </Box>
+        )
+      }
+      return fileRow(m, f, i)
+    }
+
+    const questionCard = (m: LdMsg, part: QuestionPart) => {
+      const open = part.state === 'open'
+      return (
+        <Box key={`q-${part.id}`} flexDirection="column" gap={1} padding={1} borderStyle="round" borderColor={C.border} backgroundColor={C.surface}>
+          <Text size="caption" color={C.muted}>Questions</Text>
+          {part.questions.map(q => {
+            const picked = part.selected[q.id] ?? []
+            const otherOn = picked.includes('__other__')
+            const mark = (on: boolean) => (q.multi ? (on ? '☑' : '☐') : on ? '◉' : '○')
+            return (
+              <Box key={`qq-${part.id}-${q.id}`} flexDirection="column">
+                <Text weight="semibold" color={C.text}>{q.text}</Text>
+                {q.options.map(o => (
+                  <Button key={`qo-${part.id}-${q.id}-${o.id}`} plain label={`${mark(picked.includes(o.id))}  ${o.label}`} onPress={async () => { await pickOption($, m.id, part.id, q.id, o.id, q.multi) }} />
+                ))}
+                <Button key={`qo-${part.id}-${q.id}-other`} plain label={`${mark(otherOn)}  Other`} onPress={async () => { await pickOption($, m.id, part.id, q.id, '__other__', q.multi) }} />
+                {otherOn && open ? (
+                  <Input
+                    key={`qi-${part.id}-${q.id}`}
+                    placeholder="Type your answer"
+                    value={part.other[q.id] ?? ''}
+                    submitLabel="OK"
+                    onInput={(v: string) => { void typeOther($, m.id, part.id, q.id, v) }}
+                    onSubmit={(v: string) => { void typeOther($, m.id, part.id, q.id, v) }}
+                  />
+                ) : null}
+              </Box>
+            )
+          })}
+          {open ? (
+            <Box flexDirection="row" gap={1}>
+              <Button key={`qs-${part.id}`} variant="primary" label="Submit" onPress={async () => { await submitQuestion($, m.id, part.id, false) }} />
+              <Button key={`qd-${part.id}`} label="Skip" onPress={async () => { await submitQuestion($, m.id, part.id, true) }} />
+            </Box>
+          ) : (
+            <Text size="caption" color={C.muted}>{part.state === 'sending' ? 'Sending…' : part.state === 'dismissed' ? 'Skipped' : 'Answered'}</Text>
+          )}
+        </Box>
+      )
+    }
+
+    // The steps of a reply, in order: thought, messages, tool steps, questions.
+    const partsView = (m: LdMsg) =>
+      (m.parts ?? []).map((part, i) => {
+        if (part.kind === 'thought') {
+          return (
+            <Box key={`pt-${m.id}-${i}`} flexDirection="column">
+              <Text size="caption" color={C.muted}>✦ Thought</Text>
+              {part.text ? <Text size="caption" color={C.muted} maxLines={m.pending ? 6 : 3}>{part.text}</Text> : null}
+            </Box>
+          )
+        }
+        if (part.kind === 'text') return part.text ? <Markdown key={`px-${m.id}-${i}`} text={part.text} /> : null
+        if (part.kind === 'tool') {
+          return (
+            <Text key={`ps-${m.id}-${i}`} size="caption" color={part.state === 'error' ? C.red : C.muted}>
+              {part.state === 'running' ? '◌' : part.state === 'error' ? '✕' : '✓'} {part.label}
+            </Text>
+          )
+        }
+        if (part.kind === 'question') return questionCard(m, part)
+        return <Text key={`pw-${m.id}-${i}`} size="caption" color={C.accent}>{part.label}</Text>
+      })
+
+    const projectView = (m: LdMsg) =>
+      m.project ? (
+        <Box key={`proj-${m.id}`} flexDirection="column" gap={1} padding={1} borderStyle="round" borderColor={C.border} backgroundColor={C.surface}>
+          <Text color={C.text}>📁 Project saved to {basename(m.project.dir)}</Text>
+          <Text size="caption" color={C.muted} wrap="truncate-middle">{m.project.dir}</Text>
+          <Box flexDirection="row" gap={1}>
+            {m.project.entry ? <Button key={`preview-${m.id}`} variant="primary" label="▶ Preview in browser" onPress={async () => { await openLocal($, m.project?.entry ?? '') }} /> : null}
+            <Button key={`folder-${m.id}`} label="Open folder" onPress={async () => { await openLocal($, m.project?.dir ?? '') }} />
+          </Box>
+        </Box>
+      ) : null
+
     const messages = s.messages.map(m =>
       m.role === 'user' ? (
         <Box key={'msg-' + m.id} flexDirection="row" justifyContent="flex-end">
@@ -651,10 +859,11 @@ export async function renderLangdock($: $T, e: RenderEvent, onBack: () => Promis
             <Text color={glyph(m.provider).color}>{glyph(m.provider).g}</Text>
           </Box>
           <Box flexDirection="column" flexShrink={1} gap={1}>
-            {m.pending ? <Text color={C.muted}>Thinking…</Text> : null}
-            {m.text ? <Markdown text={m.text} /> : null}
+            {m.pending ? <Text size="caption" color={C.muted}>Working…</Text> : m.seconds && m.seconds >= 5 ? <Text size="caption" color={C.muted}>Worked for {m.seconds}s</Text> : null}
+            {m.parts && m.parts.length ? partsView(m) : m.text ? <Markdown text={m.text} /> : null}
             {m.error ? <Text color={C.red}>{m.error}</Text> : null}
-            {m.files.map((f, i) => fileRow(m, f, i))}
+            {m.files.map((f, i) => fileView(m, f, i))}
+            {projectView(m)}
             {!m.pending && m.model ? <Text size="caption" color={C.muted}>{m.model}</Text> : null}
           </Box>
         </Box>

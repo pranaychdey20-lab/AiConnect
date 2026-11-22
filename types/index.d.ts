@@ -19,13 +19,17 @@ export type LdUsage = {
   fetchedAt: string
 }
 
+/** A small inline picture of an image file (a JPEG as a data URI, with its size). */
+export type LdPreview = { uri: string; w: number; h: number }
+
 /** A file in a message: saved locally (`path`) or still on Langdock (`url`). */
-export type LdFile = { name: string; path: string; kind: string; url?: string }
+export type LdFile = { name: string; path: string; kind: string; url?: string; preview?: LdPreview }
 
 export type LdResult = {
   prompt: string
   text: string
   files: LdFile[]
+  project?: LdProject
   outDir: string
   model: string
   at: string
@@ -46,11 +50,41 @@ export type LdPrefs = {
   imageHd: boolean
 }
 
+/** One multiple-choice question Langdock asks the person (its ask_user_questions tool). */
+export type LdQuestion = {
+  id: string
+  text: string
+  multi: boolean
+  options: { id: string; label: string }[]
+}
+
+/** The steps of an assistant message, in order, as they stream in. */
+export type LdPart =
+  | { kind: 'thought'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; id: string; label: string; state: 'running' | 'done' | 'error' }
+  | {
+      kind: 'question'
+      id: string
+      sessionId: string
+      questions: LdQuestion[]
+      selected: Record<string, string[]>
+      other: Record<string, string>
+      state: 'open' | 'sending' | 'answered' | 'dismissed'
+    }
+  | { kind: 'waiting'; id: string; label: string }
+
+/** A saved project: its folder, and the page to open in a browser if it has one. */
+export type LdProject = { dir: string; entry: string | null }
+
 export type LdMsg = {
   id: string
   role: 'user' | 'assistant'
   text: string
   files: LdFile[]
+  parts?: LdPart[]
+  project?: LdProject
+  seconds?: number
   model?: string
   provider?: string
   pending?: boolean
