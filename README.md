@@ -16,6 +16,13 @@ AiConnect is a collection of [Claude Code](https://claude.com/claude-code) mods,
 - **Files in, files out**: attach local files, choose a local work folder, and have generated files, zips and whole code projects saved there.
 - **A tool for Claude** (`mcp__aiconnect__langdock_ask`), offered only while connected, that returns just the final answer and local file paths so Claude's context stays small.
 
+## Let a cheap model drive and Langdock do the work
+Run Claude Code on a low-cost model, then give a whole task to a Langdock model:
+```
+/AiConnect-Langdock use opus 5.5 medium to create a snake game
+```
+The Langdock model does the entire task (short or heavy, one file or a project). Your Claude session then reviews the result, fixes small problems, puts the files in your project and runs them. Claude only reads Langdock's short answer and the saved file paths, so most of the tokens are spent on Langdock.
+
 ## Install
 
 You need [Claude Code](https://claude.com/claude-code). The Langdock part needs a Langdock account and, on your computer, `curl`, `tar` and PowerShell (all included in Windows 10 and 11).
