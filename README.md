@@ -23,6 +23,12 @@ Run Claude Code on a low-cost model, then give a whole task to a Langdock model:
 ```
 The Langdock model does the entire task (short or heavy, one file or a project). Your Claude session then reviews the result, fixes small problems, puts the files in your project and runs them. Claude only reads Langdock's short answer and the saved file paths, so most of the tokens are spent on Langdock.
 
+For a stronger review at low cost, name a reviewer:
+```
+/AiConnect-Langdock use opus 5.5 medium to create a snake game, review with fable
+```
+A single read-only Claude subagent (Opus or Fable) checks only the new files against a checklist and replies in at most 15 short bullets, which your cheap session then applies. `review on langdock fable 5.2` does the review on Langdock instead, using no Claude tokens.
+
 ## Install
 
 You need [Claude Code](https://claude.com/claude-code). The Langdock part needs a Langdock account and, on your computer, `curl`, `tar` and PowerShell (all included in Windows 10 and 11).
